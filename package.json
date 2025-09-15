@@ -10,6 +10,9 @@
     "type": "git",
     "url": "https://github.com/zocky/mlm-core.git"
   },
+  "scripts": {
+    "test": "node tests/test.js"
+  },
   "keywords": [
     "modular",
     "loader",
