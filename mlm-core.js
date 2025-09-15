@@ -20,6 +20,14 @@ export default (
 
   #context = { import: importModule }
 
+  #contextProxy = new Proxy({}, {
+    get: (target, prop) => this.#context[prop]
+  })
+
+  get context() {
+    return this.#contextProxy;
+  }
+
   #createModuleContext = (name) => {
     const ctx = new ModuleContext(name);
     return new Proxy({}, {
@@ -27,35 +35,37 @@ export default (
     });
   };
 
-  #busy = false;
   #loaders = {}
   modules = {};
   #start = [];
   #stop = [];
   #teardown = [];
-
+  #state = 'idle'
+  
   start = async (...names) => {
-    this.assert(!this.#busy, 'Cannot start while busy. Did you forget to await?');
+    this.assert(this.#state == 'idle', 'Busy.');
     for (const name of names) await this.install(name);
-    this.#busy = true;
+    // sanity check
+    this.assert(this.#state == 'idle', 'Unexpected state ' + this.#state);
+    this.#state = 'starting';
     for (const fn of this.#start) await fn();
-    this.log('Started.');
-    this.#busy = false;
+    this.#state = 'started';
   }
 
   install = async (name) => {
-    this.assert(!this.#busy, 'Cannot install while busy. Did you forget to await?');
-    this.#busy = true;
+    this.assert(this.#state == 'idle', 'Busy.');
+    this.#state = 'installing';
     await this.#install(name);
-    this.#busy = false;
+    this.#state = 'idle';
   }
 
   stop = async () => {
-    this.assert(!this.#busy, 'Cannot stop while busy. Did you forget to await?');
-    this.#busy = true;
+    this.assert(this.#state == 'started', 'Not started.');
+    this.#state = 'stopping'; 
     for (const fn of this.#stop) await fn();
+    this.#state = 'teardown';
     for (const fn of this.#teardown) await fn();
-    this.#busy = false;
+    this.#state = 'stopped';
     this.log('Stopped.');
   }
 
@@ -84,7 +94,13 @@ export default (
     ctx.assert.is.object(moduleConfig, 'Module factory return value');
 
     const module = undot(moduleConfig); // resolve dotted properties in the module object
-    module.name = name;
+    Object.defineProperty(module, 'name', {
+      value: name,
+      writable: false,
+      enumerable: true,
+      configurable: false
+    })
+    
     this.modules[name] = module; // register module config before loading dependencies
 
     ctx.assert.is.array(module.requires, '.requires');
@@ -124,7 +140,7 @@ export default (
     }
     for (const key in this.#loaders) {
       if (module[key]) {
-        await this.#loaders[key](module[key]);
+        await this.#loaders[key](module[key], module);
       }
     }
     await module.onReady?.(ctx);
