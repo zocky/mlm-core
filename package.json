@@ -8,7 +8,7 @@
   "types": "mlm-core.d.ts",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zocky/mlm-core.git"
+    "url": "git+https://github.com/zocky/mlm-core.git"
   },
   "scripts": {
     "test": "node tests/test.js"
