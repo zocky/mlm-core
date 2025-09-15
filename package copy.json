@@ -1,0 +1,24 @@
+{
+  "name": "mlm-core",
+  "version": "1.0.0",
+  "description": "MLM module loader core",
+  "type": "module",
+  "main": "mlm-core.js",
+  "author": "Zoran Obradović [https://github.com/zocky]",
+  "types": "mlm-core.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zocky/mlm-core.git"
+  },
+  "keywords": [
+    "modular",
+    "loader",
+    "plugin",
+    "wiring",
+    "javascript"
+  ],
+  "license": "LGPL-3.0-or-later",
+  "dependencies": {
+    "with-type-checkers": "^1.0.0"
+  }
+}
