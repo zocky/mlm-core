@@ -14,7 +14,7 @@ const ModuleContext = withTypeCheckers(class ModuleContext {
 export default (
   importModule, 
   resolveModule= (n) => pathToFileURL(`./modules/${n}.js`).href
-) => class MLM extends withTypeCheckers({
+) => new class MLM extends withTypeCheckers({
   classPrefix: '[MLM]'
 }) {
 
@@ -41,7 +41,7 @@ export default (
   #stop = [];
   #teardown = [];
   #state = 'idle'
-  
+
   start = async (...names) => {
     this.assert(this.#state == 'idle', 'Busy.');
     for (const name of names) await this.install(name);
@@ -85,9 +85,8 @@ export default (
   #install = async (name) => {
     if (this.modules[name]) return; // already installed/installing
     const ctx = this.#createModuleContext(name);
-    const modulePath = resolveModule(name); // modulePath is now [location, name.js]
-
-    const moduleFactory = await importModule(modulePath);
+    const modulePath = await resolveModule(name); // resolve module path with the supplied resolver
+    const moduleFactory = await importModule(modulePath); // import module with the supplied importer
     ctx.assert.is.function(moduleFactory, 'Module factory');
 
     const moduleConfig = await moduleFactory(ctx);
@@ -147,5 +146,15 @@ export default (
     module.onStart && this.#start.push(module.onStart.bind(ctx, ctx));
     module.onStop && this.#stop.push(module.onStop.bind(ctx, ctx));
     module.onTeardown && this.#teardown.unshift(module.onTeardown.bind(ctx, ctx));
+  }
+
+  static create(importer, resolver) {
+    return new MLM(importer, resolver);
+  }
+
+  static async start(name) {
+    const mlm = new MLM();
+    mlm.start(name);
+    return mlm;
   }
 }
