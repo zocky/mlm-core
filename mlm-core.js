@@ -1,7 +1,8 @@
-
 import { undot } from "./src/undot.js";
 import { withTypeCheckers } from "with-type-checkers";
 import { pathToFileURL } from 'node:url';
+
+
 const ModuleContext = withTypeCheckers(class ModuleContext {
   constructor(name) {
     this.moduleName = name;
@@ -11,27 +12,40 @@ const ModuleContext = withTypeCheckers(class ModuleContext {
   instancePrefix: (it) => '[' + it.moduleName + ']'
 })
 
+
 export default (
-  importModule, 
-  resolveModule= (n) => pathToFileURL(`./modules/${n}.js`).href
-) => new class MLM extends withTypeCheckers({
-  classPrefix: '[MLM]'
-}) {
+  importModule,
+  resolveModule = (n) => pathToFileURL(`./modules/${n}.js`).href
+) => new MLM({
+  importModule,
+  resolveModule
+});
 
-  #context = { import: importModule }
 
-  #contextProxy = new Proxy({}, {
-    get: (target, prop) => this.#context[prop]
-  })
+class MLM extends withTypeCheckers() {
+  constructor({ importModule, resolveModule }) {
+    super();
+    this.importModule = importModule;
+    this.resolveModule = resolveModule;
+    Object.defineProperty(this.#context, 'import', {
+      get: () => this.importModule,
+      enumerable: true,
+      configurable: false
+    });
+  }
 
+  #context = {}
   get context() {
-    return this.#contextProxy;
+    return this.#context
   }
 
   #createModuleContext = (name) => {
     const ctx = new ModuleContext(name);
     return new Proxy({}, {
-      get: (target, prop) => ctx[prop] ?? this.#context[prop]
+      get: (target, prop) => ctx[prop] ?? this.#context[prop],
+      set: (target, prop, value) => {
+        this.throw('Cannot set context property ' + prop);
+      },
     });
   };
 
@@ -61,7 +75,7 @@ export default (
 
   stop = async () => {
     this.assert(this.#state == 'started', 'Not started.');
-    this.#state = 'stopping'; 
+    this.#state = 'stopping';
     for (const fn of this.#stop) await fn();
     this.#state = 'teardown';
     for (const fn of this.#teardown) await fn();
@@ -75,8 +89,7 @@ export default (
       value = await value();
     }
     Object.defineProperty(this.#context, name, {
-      value: value,
-      writable: false,
+      get: () => value,
       enumerable: true,
       configurable: false
     });
@@ -85,67 +98,85 @@ export default (
   #install = async (name) => {
     if (this.modules[name]) return; // already installed/installing
     const ctx = this.#createModuleContext(name);
-    const modulePath = await resolveModule(name); // resolve module path with the supplied resolver
-    const moduleFactory = await importModule(modulePath); // import module with the supplied importer
-    ctx.assert.is.function(moduleFactory, 'Module factory');
+    try {
 
-    const moduleConfig = await moduleFactory(ctx);
-    ctx.assert.is.object(moduleConfig, 'Module factory return value');
+      const modulePath = await this.resolveModule(name) + '?t=' + Date.now(); // resolve module path with the supplied resolver
+      const jsModule = await this.importModule(modulePath); // import module with the supplied importer
+      const moduleFactory = jsModule.default;
+      ctx.assert.is.function(moduleFactory, 'Module factory');
 
-    const module = undot(moduleConfig); // resolve dotted properties in the module object
-    Object.defineProperty(module, 'name', {
-      value: name,
-      writable: false,
-      enumerable: true,
-      configurable: false
-    })
-    
-    this.modules[name] = module; // register module config before loading dependencies
+      ctx.log('Installing');
+      const moduleConfig = await moduleFactory(ctx);
+      ctx.assert.is.object(moduleConfig, 'Module factory return value');
 
-    ctx.assert.is.array(module.requires, '.requires');
+      const module = undot(moduleConfig); // resolve dotted properties in the module object
+      Object.defineProperty(module, 'name', {
+        value: name,
+        writable: false,
+        enumerable: true,
+        configurable: false
+      })
 
-    ctx.assert.is('array|undefined', module.implements);
-    ctx.assert.is('function|undefined', module.onBeforeLoad, '.onBeforeLoad');
-    ctx.assert.is('function|undefined', module.onPrepare, '.onPrepare');
-    ctx.assert.is('function|undefined', module.onReady, '.onReady');
-    ctx.assert.is('function|undefined', module.onStart, '.onStart');
-    ctx.assert.is('function|undefined', module.onStop, '.onStop');
-    ctx.assert.is('function|undefined', module.onTeardown, '.onTeardown');
-    ctx.assert.is('plainObject|undefined', module.define, '.define');
-    ctx.assert.is('plainObject|undefined', module.loaders, '.loaders');
+      this.modules[name] = module; // register module config before loading dependencies
 
-  
+      ctx.assert.is({
+        // used during install
+        onBeforeLoad: 'function|none',
+        requires: ['string'],
+        implements: 'array|none',
+        onPrepare: 'function|none',
+        define: 'plainObject|none',
+        loaders: 'plainObject|none',
+        onReady: 'function|none',
+        // used during start
+        onStart: 'function|none',
+        // used during stop
+        onStop: 'function|none',
+        onTeardown: 'function|none',
+      }, module, 'Module config');
 
-    await module.onBeforeLoad?.(ctx);
-    for (const dep of module.requires) await this.#install(dep);
 
-    for (const imp of module.implements ?? []) {
-      ctx.assert(imp.match(/^#[\w-]+$/), `Invalid implementation tag: ${imp}, must be #<tag-name>`);
-      ctx.assert.is.undefined(this.modules[imp], `Implementation tag ${imp} already exists`);
-      this.modules[imp] = module;
-    }
+      await module.onBeforeLoad?.(ctx);
+      for (const dep of module.requires) await this.#install(dep);
 
-    await module.onPrepare?.(ctx);
-
-    for (const key in module.define ?? {}) {
-      const spec = module.define[key];
-      ctx.assert.is('function|plainObject', spec, `.context.${key}`);
-      await this.#addContextProperty(key, spec);
-      ctx.log(`Defined context property .${key}`);
-    }
-    for (const key in module.loaders ?? {}) {
-      ctx.assert.is.function(module.loaders[key], `.loaders.${key}`);
-      this.#loaders[key] = module.loaders[key];
-    }
-    for (const key in this.#loaders) {
-      if (module[key]) {
-        await this.#loaders[key](module[key], module);
+      for (const imp of module.implements ?? []) {
+        ctx.assert(imp.match(/^#[\w-]+$/), `Invalid implementation tag: ${imp}, must be #<tag-name>`);
+        ctx.assert.is.undefined(this.modules[imp], `Implementation tag ${imp} already exists`);
+        this.modules[imp] = module;
       }
+
+      await module.onPrepare?.(ctx);
+
+      for (const key in module.define ?? {}) {
+        ctx.log(`Define context property .${key}`);
+        const spec = module.define[key];
+        ctx.assert.is('function|plainObject', spec, `.context.${key}`);
+        await this.#addContextProperty(key, spec);
+
+      }
+      for (const key in module.loaders ?? {}) {
+        ctx.assert.is.function(module.loaders[key], `.loaders.${key}`);
+        ctx.log(`${!this.#loaders[key] ? 'Registering new' : 'Extending existing'} loader .${key}`);
+        this.#loaders[key] ??= [];
+        this.#loaders[key].push(module.loaders[key]);
+      }
+      for (const key in this.#loaders) {
+        if (module[key]) {
+          for (const loader of this.#loaders[key]) {
+            await loader(module[key], module);
+          }
+        }
+      }
+      if (module.onReady) {
+        ctx.log('onReady');
+        await module.onReady?.(ctx);
+      }
+      module.onStart && this.#start.push(module.onStart.bind(ctx, ctx));
+      module.onStop && this.#stop.push(module.onStop.bind(ctx, ctx));
+      module.onTeardown && this.#teardown.unshift(module.onTeardown.bind(ctx, ctx));
+    } catch (err) {
+      ctx.throw(err);
     }
-    await module.onReady?.(ctx);
-    module.onStart && this.#start.push(module.onStart.bind(ctx, ctx));
-    module.onStop && this.#stop.push(module.onStop.bind(ctx, ctx));
-    module.onTeardown && this.#teardown.unshift(module.onTeardown.bind(ctx, ctx));
   }
 
   static create(importer, resolver) {
@@ -156,5 +187,24 @@ export default (
     const mlm = new MLM();
     mlm.start(name);
     return mlm;
+  }
+
+  repl(ctx = {}) {
+    console.log('Welcome to MLM REPL');
+    return new Promise((resolve) => {
+      const r = repl.start({
+        prompt: 'mlm> ',
+        useColors: true,
+        ignoreUndefined: true
+      });
+
+      Object.assign(r.context, ctx);
+      // expose the public API
+      r.context.mlmInstance = this;
+      r.context.mlm = this.context;
+
+      // wait until the repl truly closes
+      r.on('exit', resolve);
+    });
   }
 }

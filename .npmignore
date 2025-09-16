@@ -3,3 +3,4 @@ packages
 tests
 *.log
 *.mjs
+*.gz
