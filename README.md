@@ -1,247 +1,315 @@
 # MLM Core
 
-A modular loading manager for JavaScript applications that handles interdependent modules with dependency injection, lifecycle management, and implementation tags.
+A lightweight, modular microkernel for building extensible JavaScript applications through dynamic unit loading and dependency injection.
 
-## One-liner
-```js
-import MLM from 'mlm-core';
-const mlm = new MLM(p => import(p));  // importing from your app's directory and node_modules
-await mlm.start('app');               // install module from ./modules/app.js including its deps, and start
+## Overview
 
-await mlm.stop();                     // graceful shutdown
-```
+MLM Core provides a plugin architecture that allows applications to be composed from independent, reusable units. Each unit can declare dependencies, provide services, and participate in a shared application lifecycle.
 
 ## Installation
+
 ```bash
 npm install mlm-core
 ```
 
-## Basic Usage
-```javascript
-import MLM from 'mlm-core';
-
-const mlm = new MLM(
-  path => import(path),                 // pass your import function
-  (name) => `./my-modules/\${name}.js`  // resolve your module names to paths, defaults to `./modules/\${name}.js`
-);
-
-// single module
-await mlm.install('cache');
-mlm.start('cache');
-
-// or start many at once
-mlm.start('api', 'auth', 'worker');
-
-// graceful stop (calls onStop → onTeardown in reverse order)
-await mlm.stop();
-```
-
-## Module Contract
-A module **must** export a factory function that receives a context proxy and returns a plain object:
+## Quick Start
 
 ```javascript
-export default function(ctx) {
-  return {
-    // 1. dependencies
-    requires: ['logger'],          // other modules or #tags
+import mlm from 'mlm-core';
 
-    // 2. implementation tags this module provides
-    implements: ['#cache'],
+// Create MLM instance
+const app = mlm();
 
-    // 3. values published to the shared context (after deps load)
-    define: {
-      cache: () => new Map(),      // function → result is frozen
-      'config.ttl': () => 300      // dotted keys are flattened
-    },
-
-    // 4. custom loaders (optional)
-    loaders: { /* see below */ },
-
-    // 5. lifecycle hooks (optional)
-    onBeforeLoad, onPrepare, onReady, onStart, onStop, onTeardown
-  };
-}
+// Install and start units
+await app.install('database');
+await app.install('web-server');
+await app.start();
 ```
-## Context proxy
-The factory receives one argument, `ctx`, which is a Proxy that:
 
-* merges the shared MLM context (`ctx.logger`, `ctx.db` …)  
-* adds module-scoped helpers:  
-  - `ctx.assert.*` – runtime type checkers  
-  - `ctx.log(...)` – prefixed logger (`[moduleName] ...`)  
-  - `ctx.import(spec)` – **guaranteed to resolve from the application’s node_modules** (same function you passed as `importModule`)
+## Core Concepts
 
-`ctx` is already in the factory’s closure, so you do **not** need to pass it around inside the module:
+### Units
 
-```js
-export default ctx => ({
-  define: {
-    api: () => new Api({ db: ctx.db, log: ctx.log }) // ctx just works
-  }
-});
-```
-Only forward ctx to outside helpers or split files when the factory becomes too large to keep readable.
+Units are modular components that export a factory function and metadata:
 
-### Field details
-| Field        | Type       | Description |
-|--------------|------------|-------------|
-| **requires** | string[]   | Module names or `#tags` that must be installed first |
-| **implements** | string[] | Tags (must start with `#`) this module satisfies |
-| **define**   | object     | Keys become `ctx.key` for every later module. Value must be a function (called with ctx) whose return is frozen |
-| **loaders**  | object     | Map `propertyName → async fn(value)` run on every installed module that owns that property |
-| **lifecycle** | functions | Hooks run in dependency order (reverse for teardown). All may be async. |
-
-## Implementation Tags
-Tags let you swap implementations without touching consumers.
-
-**Interface module** (optional, only documents the contract):
 ```javascript
-export default () => ({
-  implements: ['#storage'],
-  define: {
-    storage: () => ({
-      get: () => { throw new Error('unimplemented') },
-      set: () => { throw new Error('unimplemented') }
-    })
-  }
+// units/logger.js
+export const info = {
+  provides: ['#logging'],
+  description: 'Application logging service'
+};
+
+export default mlm => ({
+  'define.logger': () => ({
+    info: (msg) => console.log(`[INFO] ${msg}`),
+    error: (msg) => console.error(`[ERROR] ${msg}`)
+  }),
+  onStart: () => mlm.log('Logger started')
 });
 ```
 
-**Two implementations**:
-```javascript
-// memory-storage.js
-export default () => ({
-  implements: ['#storage'],
-  define: { storage: () => new Map() }
-});
+### Dependencies
 
-// redis-storage.js
-export default async (ctx) => {
-  const client = createRedisClient(); await client.connect();
-  return {
-    implements: ['#storage'],
-    define: { storage: () => client }
-  };
+Units declare what they require and provide:
+
+```javascript
+export const info = {
+  requires: ['database', '#logging'],  // Install these first
+  provides: ['#users'],               // This unit provides user functionality
+  description: 'User management service'
 };
 ```
 
-**Consumer** (depends on **any** implementation):
+### Context System
+
+The context provides dependency injection between units:
+
 ```javascript
-export default (ctx) => ({
-  requires: ['#storage'],
-  onReady() {
-    ctx.storage.set('k', 'v'); // works with either impl
-  }
-});
-```
-
-Duplicate tags throw at install time – you can only register one provider per tag.
-
-## Custom Loaders
-Register processors that other modules can use declaratively:
-
-**router-loader.js**
-```javascript
-export default (ctx) => ({
-  requires: ['express'],
-  loaders: {
-    routes: async (routes) => {
-      for (const [path, handler] of Object.entries(routes)) {
-        ctx.express.app.get(path, handler);
-      }
+export default mlm => ({
+  'define.userService': () => ({
+    createUser: async (data) => {
+      mlm.logger.info('Creating user');
+      return mlm.database.users.create(data);
     }
-  }
+  })
 });
 ```
-
-**api.js**
-```javascript
-export default () => ({
-  requires: ['router-loader'],
-  routes: {                 // will be processed by the loader above
-    '/health': (req, res) => res.send('ok')
-  }
-});
-```
-
-Loaders run **after** `define` and **before** `onReady`.
-
-## Lifecycle Hooks
-Exact order per module:
-
-1. factory called → config validated  
-2. `onBeforeLoad(ctx)`  
-3. dependencies installed recursively  
-4. tag registered  
-5. `onPrepare(ctx)`  
-6. `define` properties created  
-7. loaders executed  
-8. `onReady(ctx)`  
-9. module marked installed  
-
-During **start** (in install order):  
-`onStart(ctx)` for every module  
-
-During **stop**:
-1. `onStop(ctx)` in install order
-2. `onTeardown(ctx)` in **reverse** order (may be async)
-
-All hooks are optional; only the first argument (context proxy) is supplied.
 
 ## API Reference
 
-### new MLM(importModule, resolveModule)
-- **importModule**: `async (fullPath) => moduleDefault`
-- **resolveModule**: `(name) => absoluteOrRelativePath`
+### MLM Instance
 
-### Instance methods
-| Method           | Description |
-|------------------|-------------|
-| **install(name)** | Promise, idempotent, recursive. *You rarely need to call this directly.* |
-| **start(...names)** | Installs if needed, then starts in dependency order |
-| **stop()** | Promise, runs onStop → onTeardown(reverse) |
+#### `mlm(options?)`
 
-### Instance properties
-| Property  | Type     | Description |
-|-----------|----------|-------------|
-| modules   | object   | Map `name → moduleConfig` (read-only) |
+Creates a new MLM instance.
 
-## Error Handling
-Runtime type checks are performed via `with-type-checkers`.  
-Duplicate modules, missing dependencies, bad tags, or wrong field types throw descriptive errors prefixed with `[MLM]` or `[moduleName]`.  
-Fail-fast is intentional: an exception in any module factory or lifecycle hook terminates the process.
+**Options:**
+- `import`: Custom module importer function
+- `resolveModule`: Custom module path resolver
 
-## Environment Composition Example
 ```javascript
-// app-dev.js  (memory cache + sqlite)
-export default () => ({
-  requires: ['cache-memory', 'db-sqlite', 'app-core']
-});
-
-// app-prod.js (redis cache + postgres)
-export default () => ({
-  requires: ['cache-redis', 'db-postgres', 'app-core']
+const app = mlm({
+  resolveModule: (name) => `./plugins/${name}/index.js`
 });
 ```
-Start the flavour you need: `mlm.start('app-prod')`.
 
-## TypeScript
-No built-in definitions yet; add
-```ts
-declare module 'mlm-core' {
-  export default class MLM {
-    constructor(
-      importModule: (path: string) => Promise<any>,
-      resolveModule: (name: string) => string
-    );
-    import(name: string): Promise<void>;
-    install(name: string): Promise<void>;
-    start(...names: string[]): void;
-    stop(): Promise<void>;
-    readonly modules: Record<string, any>;
+#### `install(unitName)`
+
+Installs a unit and its dependencies.
+
+```javascript
+await app.install('web-server');
+```
+
+#### `start(config?)`
+
+Starts all installed units.
+
+```javascript
+await app.start({ port: 3000 });
+```
+
+#### `stop()`
+
+Gracefully stops the application.
+
+```javascript
+await app.stop();
+```
+
+#### `repl(context?, options?)`
+
+Starts an interactive REPL with access to the application context.
+
+```javascript
+await app.repl({ customVar: 'value' }, { screen: true });
+```
+
+### Unit Configuration
+
+Units export a factory function that returns a configuration object:
+
+```javascript
+export default function(mlm) {
+  return {
+    // Lifecycle hooks
+    onBeforeLoad: async (mlm) => { /* ... */ },
+    onPrepare: async (mlm) => { /* ... */ },
+    onReady: async (mlm) => { /* ... */ },
+    onStart: async (config) => { /* ... */ },
+    onStop: async () => { /* ... */ },
+    onShutdown: async () => { /* ... */ },
+    
+    // Context definitions
+    define: {
+      serviceName: () => serviceInstance,
+      configValue: { value: 'data' }
+    },
+    
+    // Custom loaders
+    register: {
+      customLoader: async (config, unit) => { /* ... */ }
+    }
+  };
+}
+```
+
+### Unit Metadata
+
+The `info` export describes the unit:
+
+```javascript
+export const info = {
+  requires: ['dependency1', '#feature-tag'],
+  provides: ['#my-feature'],
+  description: 'Unit description',
+  npm: { /* npm dependencies */ },
+  version: '1.0.0',
+  author: 'Author Name'
+};
+```
+
+## Lifecycle
+
+1. **Install Phase**
+   - `onBeforeLoad`: Prepare for installation
+   - Dependency resolution and installation
+   - Feature tag registration
+   - `onPrepare`: Setup internal state
+   - Context property definition
+   - Custom loader registration
+   - `onReady`: Finalize installation
+
+2. **Start Phase**
+   - `onStart`: Initialize runtime services
+   - System marked as started
+
+3. **Stop Phase**
+   - `onStop`: Graceful shutdown of services
+   - `onShutdown`: Final cleanup (reverse order)
+
+## Advanced Features
+
+### Custom Module Resolution
+
+```javascript
+import { pathToFileURL } from 'node:url';
+
+const app = mlm({
+  resolveModule: (name) => {
+    if (name.startsWith('@')) {
+      return pathToFileURL(`./scoped/${name.slice(1)}.js`).href;
+    }
+    return pathToFileURL(`./units/${name}.js`).href;
   }
+});
+```
+
+### Feature Tags
+
+Units can provide feature tags that other units can depend on:
+
+```javascript
+// Provider
+export const info = {
+  provides: ['#database']
+};
+
+// Consumer  
+export const info = {
+  requires: ['#database']  // Any unit providing #database
+};
+```
+
+### Custom Loaders
+
+Units can register custom processing steps. There are two equivalent syntaxes:
+
+```javascript
+// Canonical arrow function syntax
+export default mlm => ({
+  'register.middleware': async (middlewareConfig, unit) => {
+    mlm.app.use(middlewareConfig);
+  }
+});
+
+// Traditional function syntax (useful when you need local variables)
+export default function(mlm) {
+  const localConfig = computeConfig();
+  
+  return {
+    register: {
+      middleware: async (middlewareConfig, unit) => {
+        mlm.app.use(middlewareConfig);
+      }
+    }
+  };
+}
+
+// Use the loader
+export default mlm => ({
+  middleware: {
+    path: '/api',
+    handler: (req, res) => res.json({ status: 'ok' })
+  }
+});
+```
+
+### Dotted Key Notation
+
+MLM Core supports dotted key notation as a convenience syntax. Dotted keys are processed before unit installation, so `'define.serviceName'` is exactly equivalent to `define: { serviceName: ... }`. This allows for cleaner, flatter configuration objects:
+
+```javascript
+// These are equivalent:
+export default mlm => ({
+  'define.logger': () => loggerService,
+  'register.middleware': middlewareLoader
+});
+
+export default mlm => ({
+  define: {
+    logger: () => loggerService
+  },
+  register: {
+    middleware: middlewareLoader
+  }
+});
+```
+
+## Error Handling
+
+MLM Core includes comprehensive error handling:
+
+- **State validation**: Operations are validated against current lifecycle state
+- **Type checking**: Runtime validation of unit configurations
+- **Dependency cycles**: Automatic detection of circular dependencies
+- **Concurrent installs**: Prevention of race conditions during unit loading
+
+## Development
+
+### REPL
+
+Access the application state interactively:
+
+```javascript
+await app.repl();
+// mlm > mlm.logger.info('Hello from REPL')
+// mlm > mlmInstance.units
+```
+
+### Debugging
+
+Enable detailed logging by accessing unit contexts:
+
+```javascript
+// Each unit gets a context with logging
+export default function(mlm) {
+  mlm.log('Unit initialized');
+  mlm.assert(condition, 'Assertion message');
+  return { /* ... */ };
 }
 ```
 
 ## License
+
 LGPL-3.0-or-later
