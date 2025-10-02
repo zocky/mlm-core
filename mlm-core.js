@@ -47,6 +47,13 @@ class MLM extends withTypeCheckers({
         configurable: false
       }
     });
+    this.#addLoader('define', async (conf, unit) => {
+      for (const key in conf) {
+        const spec = conf[key];
+        this.assert.is('function|plainObject', spec, `.define.${key}`);
+        await this.#addContextProperty(key, spec);
+      }
+    });
   }
 
   #context = {}
@@ -146,19 +153,16 @@ class MLM extends withTypeCheckers({
     }
   }
 
-  #registerLoaders = {
-    register: [(name, loader) => {
-      this.#register[name] ??= [];
-      this.#register[name].push(loader);
-    }]
-  }
-  #register = {}
+  #registeredLoaders = {}
 
-  #addProcess = (name, loader) => {
-    this.#registerLoaders[name] ??= [];
-    this.#registerLoaders[name].push(loader);
+  #register = {} // we are exposing mlm.register.<name>(conf, unit) through this
+
+  #addLoader = (name, loader) => {
+    this.#registeredLoaders[name] ??= [];
+    this.#registeredLoaders[name].push(loader);
     this.#register[name] ??= async (conf, unit) => {
-      for (const loader of this.#registerLoaders[name]) {
+      for (const loader of this.#registeredLoaders[name]) {
+        console.log(`[MLM] [${unit.name}] Processing loader .${name} ${Object.keys(conf)}`);
         await loader(conf, unit);
       }
     };
@@ -227,18 +231,10 @@ class MLM extends withTypeCheckers({
       }
 
       await unit.onPrepare?.(ctx);
+      for (const key in unit.register) {
+        this.#addLoader(key, unit.register[key], unit);
+      }
 
-      for (const key in unit.define ?? {}) {
-        ctx.log(`Define context property .${key}`);
-        const spec = unit.define[key];
-        ctx.assert.is('function|plainObject', spec, `.context.${key}`);
-        await this.#addContextProperty(key, spec);
-      }
-      for (const key in unit.register ?? {}) {
-        ctx.assert.is.function(unit.register[key], `.register.${key}`);
-        ctx.log(`${!this.#registerLoaders[key] ? 'Processing new' : 'Extending existing'} loader .${key}`);
-        this.#addProcess(key, unit.register[key]);
-      }
       for (const key in this.#register) {
         if (unit[key]) {
           await this.#register[key](unit[key], unit);
