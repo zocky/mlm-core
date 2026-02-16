@@ -41,8 +41,8 @@ class MLM extends withTypeCheckers({
         get: () => this.#importModule,
         enumerable: true,
         configurable: false
-      }, register: {
-        get: () => this.#register,
+      }, inject: {
+        value: (conf, unit) => this.#inject(undot(conf), unit),
         enumerable: true,
         configurable: false
       }
@@ -155,7 +155,7 @@ class MLM extends withTypeCheckers({
 
   #registeredLoaders = {}
 
-  #register = {} // we are exposing mlm.register.<name>(conf, unit) through this
+  #register = {}
 
   #addLoader = (name, loader) => {
     this.#registeredLoaders[name] ??= [];
@@ -166,6 +166,16 @@ class MLM extends withTypeCheckers({
         await loader(conf, unit);
       }
     };
+  }
+  #inject = async (conf, unit) => {
+    for (const key in conf.register) {
+      this.#addLoader(key, conf.register[key], unit);
+    }
+    for (const key in this.#register) {
+      if (conf[key]) {
+        await this.#register[key](conf[key], unit);
+      }
+    }
   }
   #installing = new Set();
   #install = async (name) => {
@@ -189,7 +199,7 @@ class MLM extends withTypeCheckers({
       const unitConfig = unitFactory ? await unitFactory(ctx) : {};
       ctx.assert.is.object(unitConfig, 'Unit factory return value');
 
-      const unit = this.units[name] = undot(unitConfig);
+      const unit = this.units[name] = undot(unitConfig); // deepen dot notated object
       unit.info = info;
       unit.module = module;
 
@@ -214,7 +224,7 @@ class MLM extends withTypeCheckers({
         onShutdown: 'function|none',
       }, unit, 'Unit config');
 
-      await unit.onBeforeLoad?.(ctx);
+      await unit.onBeforeLoad?.();
 
       for (const dep of unit.info.requires) {
         if (this.units[dep]) continue;
@@ -230,19 +240,13 @@ class MLM extends withTypeCheckers({
         this.units[tag] = unit;
       }
 
-      await unit.onPrepare?.(ctx);
-      for (const key in unit.register) {
-        this.#addLoader(key, unit.register[key], unit);
-      }
+      await unit.onPrepare?.();
 
-      for (const key in this.#register) {
-        if (unit[key]) {
-          await this.#register[key](unit[key], unit);
-        }
-      }
+      await this.#inject(unit, unit);
+
       if (unit.onReady) {
         ctx.log('onReady');
-        await unit.onReady?.(ctx);
+        await unit.onReady?.();
       }
       unit.onStart && this.#onStart.push(unit.onStart);
       unit.onStop && this.#onStop.push(unit.onStop);
@@ -252,6 +256,17 @@ class MLM extends withTypeCheckers({
     } finally {
       this.#installing.delete(name);
     }
+  }
+
+
+  static create(importer, resolver) {
+    return new MLM(importer, resolver);
+  }
+
+  static async start(name) {
+    const mlm = new MLM();
+    mlm.start(name);
+    return mlm;
   }
 
   analyze = async (name) => {
@@ -309,15 +324,6 @@ class MLM extends withTypeCheckers({
 
     await analyzeUnit(name);
     return result;
-  }
-  static create(importer, resolver) {
-    return new MLM(importer, resolver);
-  }
-
-  static async start(name) {
-    const mlm = new MLM();
-    mlm.start(name);
-    return mlm;
   }
 
   repl(ctx = {}, { screen = false } = {}) {
