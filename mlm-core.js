@@ -36,17 +36,6 @@ class MLM extends withTypeCheckers({
     super();
     this.#importModule = importModule;
     this.#resolveModule = resolveModule;
-    Object.defineProperties(this.#context, {
-      'import': {
-        get: () => this.#importModule,
-        enumerable: true,
-        configurable: false
-      }, inject: {
-        value: (conf, unit) => this.#inject(undot(conf), unit),
-        enumerable: true,
-        configurable: false
-      }
-    });
     this.#addLoader('define', async (conf, unit) => {
       for (const key in conf) {
         const spec = conf[key];
@@ -61,8 +50,12 @@ class MLM extends withTypeCheckers({
     return this.#context
   }
 
-  #createUnitContext = (name) => {
+  #createUnitContext = async (name, info) => {
     const ctx = new UnitContext(name);
+    ctx.packages = {};
+    for (const pkg in info.packages) {
+      ctx.packages[pkg] = await this.#importModule(info.packages[pkg]);
+    }
     return new Proxy({}, {
       get: (target, prop) => ctx[prop] ?? this.#context[prop],
       set: (target, prop, value) => {
@@ -128,54 +121,48 @@ class MLM extends withTypeCheckers({
   #importUnitWithInfo = async (name) => {
     const modulePath = await this.#resolveModule(name);
     try {
-      const module = await this.#importModule(modulePath); // + '?t=' + Date.now() do we need this?;
+      const module = await this.#importModule(modulePath);
       const ret = {
         modulePath,
         module,
         unitFactory: module.default
       }
       this.assert(this.is.plainObject(module.info), 'No export info found for unit ' + name + ' at ' + modulePath);
-      ret.info = this.#createInfo(module.info);
+      ret.info = this.#createInfo(module.info,name,modulePath);
       return ret;
     } catch (e) {
       this.throw(`Failed to import unit '${name}': ${modulePath} - ${e.message}`);
     }
   }
 
-  #createInfo(info = {}) {
+  #createInfo(info = {}, name, modulePath) {
+    if (info.packages) {
+      let packages = {}
+      for (const dep of [].concat(info.packages)) {
+        if (typeof dep === 'string') {
+          packages[dep] = dep;
+        } else {
+          Object.assign(packages, dep);
+        }
+      }
+      info.packages = packages
+    }
     return {
       requires: info.requires ?? [],
       provides: info.provides ?? [],
-      npm: info.npm ?? {},
+      packages: info.packages ?? {},
       description: info.description ?? 'No description provided for ' + name + ' at  ' + modulePath,
       version: null,
       author: null
     }
   }
 
+  #registeredInjectors = {}
   #registeredLoaders = {}
-
-  #register = {}
 
   #addLoader = (name, loader) => {
     this.#registeredLoaders[name] ??= [];
     this.#registeredLoaders[name].push(loader);
-    this.#register[name] ??= async (conf, unit) => {
-      for (const loader of this.#registeredLoaders[name]) {
-        console.log(`[MLM] [${unit.name}] Processing loader .${name} ${Object.keys(conf)}`);
-        await loader(conf, unit);
-      }
-    };
-  }
-  #inject = async (conf, unit) => {
-    for (const key in conf.register) {
-      this.#addLoader(key, conf.register[key], unit);
-    }
-    for (const key in this.#register) {
-      if (conf[key]) {
-        await this.#register[key](conf[key], unit);
-      }
-    }
   }
   #installing = new Set();
   #install = async (name) => {
@@ -185,7 +172,6 @@ class MLM extends withTypeCheckers({
     }
     this.#installing.add(name);
 
-    const ctx = this.#createUnitContext(name);
     try {
       let {
         unitFactory,
@@ -193,6 +179,7 @@ class MLM extends withTypeCheckers({
         modulePath,
         info
       } = await this.#importUnitWithInfo(name);
+      const ctx = await this.#createUnitContext(name, info);
 
       ctx.log(`Installing from ${modulePath}`);
       ctx.assert.is('function|none', unitFactory, 'Module factory');
@@ -215,6 +202,7 @@ class MLM extends withTypeCheckers({
         onBeforeLoad: 'function|none',
         onPrepare: 'function|none',
         define: 'plainObject|none',
+        inject: 'plainObject|none',
         register: 'plainObject|none',
         onReady: 'function|none',
         // used during start
@@ -225,6 +213,8 @@ class MLM extends withTypeCheckers({
       }, unit, 'Unit config');
 
       await unit.onBeforeLoad?.();
+
+
 
       for (const dep of unit.info.requires) {
         if (this.units[dep]) continue;
@@ -242,15 +232,45 @@ class MLM extends withTypeCheckers({
 
       await unit.onPrepare?.();
 
-      await this.#inject(unit, unit);
+      const layers = [unit];
 
-      if (unit.onReady) {
-        ctx.log('onReady');
-        await unit.onReady?.();
+      for (const key in unit.inject) {
+        ctx.assert(!(key in this.#registeredInjectors), 'Duplicate injector key ' + key);
+        this.#registeredInjectors[key] = unit.inject[key];
       }
-      unit.onStart && this.#onStart.push(unit.onStart);
-      unit.onStop && this.#onStop.push(unit.onStop);
-      unit.onShutdown && this.#onShutdown.unshift(unit.onShutdown);
+      for (const key in this.#registeredInjectors) {
+        const conf = unit[key];
+        if (conf) {
+          const inject = await this.#registeredInjectors[key](conf, unit);
+          inject && layers.push(undot(inject));
+        }
+      }
+
+      for (const conf of layers) {
+        for (const key in conf.register) {
+          this.#addLoader(key, conf.register[key], unit);
+        }
+      }
+      for (const key in this.#registeredLoaders) {
+        for (const conf of layers) {
+          if (conf[key]) {
+            for (const loader of this.#registeredLoaders[key]) {
+              ctx.log(`Processing loader [${unit.name}] ${key}: ${Object.keys(conf[key])}`);
+              await loader(conf[key], unit);
+            }
+          }
+        }
+      }
+      for (const layer of layers) {
+        if (layer.onReady) {
+          ctx.log('onReady');
+          await layer.onReady?.();
+        }
+      }
+
+      this.#onStart.push(...layers.map(layer=>layer.onStart).filter(Boolean));
+      this.#onStop.push(...layers.map(layer=>layer.onStop).filter(Boolean));
+      this.#onShutdown.unshift(...layers.map(layer=>layer.onShutdown).filter(Boolean));
     } catch (err) {
       throw err;
     } finally {
@@ -258,16 +278,6 @@ class MLM extends withTypeCheckers({
     }
   }
 
-
-  static create(importer, resolver) {
-    return new MLM(importer, resolver);
-  }
-
-  static async start(name) {
-    const mlm = new MLM();
-    mlm.start(name);
-    return mlm;
-  }
 
   analyze = async (name) => {
     const result = {

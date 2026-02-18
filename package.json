@@ -23,8 +23,5 @@
   "license": "LGPL-3.0-or-later",
   "dependencies": {
     "with-type-checkers": "^1.0.6"
-  },
-  "devDependencies": {
-    "with-type-checkers": "../with-type-checkers"
   }
 }
